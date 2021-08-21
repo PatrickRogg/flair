@@ -819,3 +819,240 @@ class TARSClassifier(FewshotClassifier):
 
         if return_loss:
             return overall_loss, overall_count
+
+
+class TARSMLNIClassifier(FewshotClassifier):
+    """
+    TARS multilingual model for text classification. In the backend, the model uses a BERT based binary
+    text classifier which given a <label, text> pair predicts the probability of two classes
+    "True", and "False". The input data is a usual Sentence object which is inflated
+    by the model internally before pushing it through the transformer stack of BERT.
+    """
+
+    static_label_type = "tars_label"
+
+    def __init__(
+            self,
+            task_name: str,
+            label_dictionary: Dictionary,
+            label_type: str,
+            embeddings: str = 'bert-base-multilingual-uncased',
+            num_negative_labels_to_sample: int = 2,
+            prefix: bool = True,
+            **tagger_args,
+    ):
+        """
+        Initializes a TextClassifier
+        :param task_name: a string depicting the name of the task
+        :param label_dictionary: dictionary of labels you want to predict
+        :param embeddings: name of the pre-trained transformer model e.g.,
+        'bert-base-uncased' etc
+        :param num_negative_labels_to_sample: number of negative labels to sample for each
+        positive labels against a sentence during training. Defaults to 2 negative
+        labels for each positive label. The model would sample all the negative labels
+        if None is passed. That slows down the training considerably.
+        :param multi_label: auto-detected by default, but you can set this to True
+        to force multi-label predictionor False to force single-label prediction
+        :param multi_label_threshold: If multi-label you can set the threshold to make predictions
+        :param beta: Parameter for F-beta score for evaluation and training annealing
+        """
+        super(TARSMLNIClassifier, self).__init__()
+
+        from flair.embeddings import TransformerDocumentEmbeddings
+
+        if not isinstance(embeddings, TransformerDocumentEmbeddings):
+            embeddings = TransformerDocumentEmbeddings(model=embeddings,
+                                                       fine_tune=True,
+                                                       layers='-1',
+                                                       layer_mean=False,
+                                                       )
+
+        # prepare TARS dictionary
+        tars_dictionary = Dictionary(add_unk=False)
+        tars_dictionary.add_item('False')
+        tars_dictionary.add_item('True')
+
+        # initialize a bare-bones sequence tagger
+        self.tars_model = TextClassifier(document_embeddings=embeddings,
+                                         label_dictionary=tars_dictionary,
+                                         label_type=self.static_label_type,
+                                         **tagger_args,
+                                         )
+
+        # transformer separator
+        self.separator = str(self.tars_embeddings.tokenizer.sep_token)
+        if self.tars_embeddings.tokenizer._bos_token:
+            self.separator += str(self.tars_embeddings.tokenizer.bos_token)
+
+        self.prefix = prefix
+        self.num_negative_labels_to_sample = num_negative_labels_to_sample
+
+        # Store task specific labels since TARS can handle multiple tasks
+        self.add_and_switch_to_new_task(task_name, label_dictionary, label_type)
+
+    def _get_tars_formatted_sentence(self, label, sentence):
+
+        original_text = sentence.to_tokenized_string()
+
+        label_text_pair = f"{label} {self.separator} {original_text}" if self.prefix \
+            else f"{original_text} {self.separator} {label}"
+
+        sentence_labels = [label.value for label in sentence.get_labels(self.get_current_label_type())]
+
+        tars_label = "True" if label in sentence_labels else "False"
+
+        tars_sentence = Sentence(label_text_pair, use_tokenizer=False).add_label(self.static_label_type, tars_label)
+
+        return tars_sentence
+
+    def _get_state_dict(self):
+        model_state = {
+            "state_dict": self.state_dict(),
+
+            "current_task": self._current_task,
+            "label_type": self.get_current_label_type(),
+            "label_dictionary": self.get_current_label_dictionary(),
+            "tars_model": self.tars_model,
+            "num_negative_labels_to_sample": self.num_negative_labels_to_sample,
+
+            "task_specific_attributes": self._task_specific_attributes,
+        }
+        return model_state
+
+    @staticmethod
+    def _init_model_with_state_dict(state):
+        print("init TARS multilingual")
+
+        # init new TARS classifier
+        label_dictionary = state["label_dictionary"]
+
+        model: TARSMLNIClassifier = TARSMLNIClassifier(
+            task_name=state["current_task"],
+            label_dictionary=label_dictionary,
+            label_type=state["label_type"],
+            embeddings=state["tars_model"].document_embeddings,
+            num_negative_labels_to_sample=state["num_negative_labels_to_sample"],
+        )
+
+        # set all task information
+        model.task_specific_attributes = state["task_specific_attributes"]
+        # linear layers of internal classifier
+        model.load_state_dict(state["state_dict"])
+        return model
+
+    @staticmethod
+    def _fetch_model(model_name) -> str:
+
+        model_map = {}
+        hu_path: str = "https://nlp.informatik.hu-berlin.de/resources/models"
+
+        model_map["tars-base"] = "/".join([hu_path, "tars-base", "tars-base-v8.pt"])
+
+        cache_dir = Path("models")
+        if model_name in model_map:
+            model_name = cached_path(model_map[model_name], cache_dir=cache_dir)
+
+        return model_name
+
+    @property
+    def tars_embeddings(self):
+        return self.tars_model.document_embeddings
+
+    def predict(
+            self,
+            sentences: Union[List[Sentence], Sentence],
+            mini_batch_size=32,
+            verbose: bool = False,
+            label_name: Optional[str] = None,
+            return_loss=False,
+            embedding_storage_mode="none",
+    ):
+        # return
+        """
+        Predict sequence tags for Named Entity Recognition task
+        :param sentences: a Sentence or a List of Sentence
+        :param mini_batch_size: size of the minibatch, usually bigger is more rapid but consume more memory,
+        up to a point when it has no more effect.
+        :param all_tag_prob: True to compute the score for each tag on each token,
+        otherwise only the score of the best tag is returned
+        :param verbose: set to True to display a progress bar
+        :param return_loss: set to True to return loss
+        :param label_name: set this to change the name of the label type that is predicted
+        :param embedding_storage_mode: default is 'none' which is always best. Only set to 'cpu' or 'gpu' if
+        you wish to not only predict, but also keep the generated embeddings in CPU or GPU memory respectively.
+        'gpu' to store embeddings in GPU memory.
+        """
+        if label_name == None:
+            label_name = self.get_current_label_type()
+
+        # with torch.no_grad():
+        if not sentences:
+            return sentences
+
+        if isinstance(sentences, Sentence):
+            sentences = [sentences]
+
+        # set context if not set already
+        previous_sentence = None
+        for sentence in sentences:
+            if sentence.is_context_set(): continue
+            sentence._previous_sentence = previous_sentence
+            sentence._next_sentence = None
+            if previous_sentence: previous_sentence._next_sentence = sentence
+            previous_sentence = sentence
+
+        # reverse sort all sequences by their length
+        rev_order_len_index = sorted(range(len(sentences)), key=lambda k: len(sentences[k]), reverse=True)
+
+        reordered_sentences: List[Union[Sentence, str]] = [sentences[index] for index in rev_order_len_index]
+
+        dataloader = DataLoader(dataset=SentenceDataset(reordered_sentences), batch_size=mini_batch_size)
+
+        # progress bar for verbosity
+        if verbose:
+            dataloader = tqdm(dataloader)
+
+        overall_loss = 0
+        overall_count = 0
+        batch_no = 0
+        with torch.no_grad():
+            for batch in dataloader:
+
+                batch_no += 1
+
+                if verbose:
+                    dataloader.set_description(f"Inferencing on batch {batch_no}")
+
+                batch = self._filter_empty_sentences(batch)
+                # stop if all sentences are empty
+                if not batch:
+                    continue
+
+                # go through each sentence in the batch
+                for sentence in batch:
+
+                    # always remove tags first
+                    sentence.remove_labels(label_name)
+
+                    all_labels = [label.decode("utf-8") for label in self.get_current_label_dictionary().idx2item]
+
+                    all_detected = {}
+                    for label in all_labels:
+                        tars_sentence = self._get_tars_formatted_sentence(label, sentence)
+
+                        loss_and_count = self.tars_model.predict(tars_sentence,
+                                                                 label_name=label_name,
+                                                                 return_loss=True)
+
+                        overall_loss += loss_and_count[0].item()
+                        overall_count += loss_and_count[1]
+
+                        predicted_tars_label = tars_sentence.get_labels(label_name)[0]
+                        if predicted_tars_label.value == "True":
+                            sentence.add_label(label_name, label, predicted_tars_label.score)
+
+                # clearing token embeddings to save memory
+                store_embeddings(batch, storage_mode=embedding_storage_mode)
+
+        if return_loss:
+            return overall_loss, overall_count
